@@ -1,17 +1,45 @@
+using katherine_inventory_with_pos.DataAccess;
+using MySql.Data.MySqlClient;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
-using MySql.Data.MySqlClient;
+using System.Drawing;
 using System.Linq;
+using System.Runtime.Remoting.Metadata.W3cXsd2001;
+using System.Text;
 using System.Windows.Forms;
-using katherine_inventory_with_pos.DataAccess;
 
 namespace katherine_inventory_with_pos.Forms
 {
     public partial class frmPointOfSale : Form
     {
+        // ------------------------------------------------------------------
+        // Tax settings
+        // ------------------------------------------------------------------
+        private const decimal VatRate = 0.12m;                          // 12% VAT
+        // false = shelf prices do NOT include VAT, so 12% is ADDED at checkout.
+        // true  = shelf prices already include VAT, so VAT is only shown, not added.
+        private static readonly bool PricesIncludeVat = false;
+
+        private const decimal SeniorPwdRate = 0.20m;                    // 20% SC / PWD discount
+
+        // Indexes of cboDiscountType items (same order as the designer)
+        private const int DiscNone = 0, DiscSenior = 1, DiscPwd = 2, DiscPercent = 3, DiscFixed = 4;
+
         private readonly BindingList<CartItem> cart = new BindingList<CartItem>();
+        private DataTable productTable;
+        private DataView productView;
+        private bool loadingProducts;
+        private List<string> lastReceipt;
+
+        private class OrderTotals
+        {
+            public decimal Subtotal;
+            public decimal Discount;
+            public decimal Vat;
+            public decimal Total;
+        }
 
         public frmPointOfSale()
         {
@@ -20,6 +48,7 @@ namespace katherine_inventory_with_pos.Forms
 
         private void frmPointOfSale_Load(object sender, EventArgs e)
         {
+            // cart grid
             dgvCart.AutoGenerateColumns = false;
             colProductCode.DataPropertyName = "ProductCode";
             colProductName.DataPropertyName = "ProductName";
@@ -28,20 +57,225 @@ namespace katherine_inventory_with_pos.Forms
             colSubtotal.DataPropertyName = "Subtotal";
             colUnitPrice.DefaultCellStyle.Format = "N2";
             colSubtotal.DefaultCellStyle.Format = "N2";
-
             dgvCart.DataSource = cart;
-            cboPaymentMethod.SelectedIndex = 0;
 
+            // product grid
+            dgvProducts.AutoGenerateColumns = false;
+            colPName.DataPropertyName = "ProductName";
+            colPPrice.DataPropertyName = "Price";
+            colPStock.DataPropertyName = "Stock";
+            colPPrice.DefaultCellStyle.Format = "N2";
+
+            cboPaymentMethod.SelectedIndex = 0;
+            cboDiscountType.SelectedIndex = DiscNone;
+            lblVatCaption.Text = PricesIncludeVat
+                ? "VAT (" + (VatRate * 100m).ToString("0") + "% incl.)"
+                : "VAT (" + (VatRate * 100m).ToString("0") + "%)";
+
+            LoadProducts();
+            RecalculateTotals();
             txtBarcode.Focus();
+        }
+
+        // ------------------------------------------------------------------
+        // Keyboard shortcuts: F2 barcode, F3 search, F9 checkout, Del remove line
+        // ------------------------------------------------------------------
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            switch (keyData)
+            {
+                case Keys.F2:
+                    txtBarcode.Focus();
+                    txtBarcode.SelectAll();
+                    return true;
+                case Keys.F3:
+                    txtSearch.Focus();
+                    txtSearch.SelectAll();
+                    return true;
+                case Keys.F9:
+                    btnCheckout.PerformClick();
+                    return true;
+                case Keys.Delete:
+                    if (dgvCart.Focused && !dgvCart.IsCurrentCellInEditMode)
+                    {
+                        btnRemoveItem.PerformClick();
+                        return true;
+                    }
+                    break;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        // ------------------------------------------------------------------
+        // Product list (left panel)
+        // ------------------------------------------------------------------
+        private void LoadProducts()
+        {
+            try
+            {
+                loadingProducts = true;
+
+                productTable = DBConnection.ExecuteQuery(
+                    "SELECT p.product_id AS ProductID, IFNULL(p.barcode, '') AS Barcode, " +
+                    "p.product_name AS ProductName, IFNULL(c.category_name, 'Uncategorized') AS Category, " +
+                    "p.selling_price AS Price, CAST(IFNULL(s.quantity, 0) AS SIGNED) AS Stock " +
+                    "FROM tbl_product p " +
+                    "LEFT JOIN tbl_category c ON c.category_id = p.category_id " +
+                    "LEFT JOIN tbl_stock s ON s.product_id = p.product_id " +
+                    "WHERE p.product_status = 'Active' " +
+                    "ORDER BY p.product_name;");
+
+                // keep the selected category if it still exists
+                string previousCategory = cboCategory.SelectedIndex > 0 ? cboCategory.Text : null;
+
+                cboCategory.Items.Clear();
+                cboCategory.Items.Add("All Categories");
+                foreach (string cat in productTable.AsEnumerable()
+                    .Select(r => r.Field<string>("Category")).Distinct().OrderBy(c => c))
+                {
+                    cboCategory.Items.Add(cat);
+                }
+
+                int idx = previousCategory == null ? 0 : cboCategory.Items.IndexOf(previousCategory);
+                cboCategory.SelectedIndex = idx < 0 ? 0 : idx;
+
+                productView = new DataView(productTable);
+                dgvProducts.DataSource = productView;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not load the product list:\n" + ex.Message, "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                loadingProducts = false;
+            }
+
+            ApplyProductFilter();
+        }
+
+        private void ApplyProductFilter()
+        {
+            if (productView == null || loadingProducts) return;
+
+            List<string> filters = new List<string>();
+
+            string text = txtSearch.Text.Trim();
+            if (text.Length > 0)
+            {
+                string escaped = EscapeForRowFilter(text);
+                filters.Add("(ProductName LIKE '%" + escaped + "%' OR Barcode LIKE '%" + escaped + "%')");
+            }
+
+            if (cboCategory.SelectedIndex > 0)
+            {
+                filters.Add("Category = '" + cboCategory.Text.Replace("'", "''") + "'");
+            }
+
+            productView.RowFilter = string.Join(" AND ", filters);
+        }
+
+        /// <summary>Escapes a user-typed string for use inside a DataView RowFilter LIKE '%...%'.</summary>
+        private static string EscapeForRowFilter(string value)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in value)
+            {
+                switch (c)
+                {
+                    case '\'': sb.Append("''"); break;
+                    case '[': sb.Append("[[]"); break;
+                    case ']': sb.Append("[]]"); break;
+                    case '*': sb.Append("[*]"); break;
+                    case '%': sb.Append("[%]"); break;
+                    default: sb.Append(c); break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        private void txtSearch_TextChanged(object sender, EventArgs e)
+        {
+            ApplyProductFilter();
+        }
+
+        private void txtSearch_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                // Enter adds the first match, so you can type a name and press Enter.
+                if (dgvProducts.Rows.Count > 0)
+                {
+                    dgvProducts.CurrentCell = dgvProducts.Rows[0].Cells[0];
+                    AddSelectedProductToCart();
+                }
+            }
+            else if (e.KeyCode == Keys.Down && dgvProducts.Rows.Count > 0)
+            {
+                e.SuppressKeyPress = true;
+                dgvProducts.Focus();
+            }
+        }
+
+        private void cboCategory_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            ApplyProductFilter();
+        }
+
+        private void dgvProducts_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex >= 0) AddSelectedProductToCart();
+        }
+
+        private void dgvProducts_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                AddSelectedProductToCart();
+            }
+        }
+
+        private void btnAddSelected_Click(object sender, EventArgs e)
+        {
+            AddSelectedProductToCart();
+        }
+
+        // Grey out and mark products that are out of stock; flag low stock in orange.
+        private void dgvProducts_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
+        {
+            if (e.RowIndex < 0) return;
+            DataRowView drv = dgvProducts.Rows[e.RowIndex].DataBoundItem as DataRowView;
+            if (drv == null) return;
+
+            int stock = Convert.ToInt32(drv["Stock"]);
+            if (stock <= 0)
+                e.CellStyle.ForeColor = Color.Firebrick;
+            else if (stock <= 5 && e.ColumnIndex == colPStock.Index)
+                e.CellStyle.ForeColor = Color.DarkOrange;
+        }
+
+        private void AddSelectedProductToCart()
+        {
+            if (dgvProducts.CurrentRow == null) return;
+            DataRowView drv = dgvProducts.CurrentRow.DataBoundItem as DataRowView;
+            if (drv == null) return;
+
+            AddToCart(
+                drv["ProductID"].ToString(),
+                drv["Barcode"].ToString(),
+                drv["ProductName"].ToString(),
+                Convert.ToDecimal(drv["Price"]),
+                Convert.ToInt32(drv["Stock"]));
         }
 
         // ------------------------------------------------------------------
         // Barcode scanning
         // ------------------------------------------------------------------
-        // Most USB / Bluetooth barcode scanners act as a keyboard: they "type" the
-        // barcode digits very quickly and finish with an Enter key press. Handling
-        // KeyDown for Enter on a plain TextBox is therefore all that is needed to
-        // support a real scanner - no special SDK is required.
+        // USB / Bluetooth scanners act like a keyboard: they "type" the barcode and
+        // finish with Enter, so handling Enter on a plain TextBox is all that is needed.
         private void txtBarcode_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.KeyCode != Keys.Enter) return;
@@ -80,8 +314,6 @@ namespace katherine_inventory_with_pos.Forms
                     {
                         RegisterAndAddProduct(code);
                     }
-
-                    txtBarcode.Focus();
                     return;
                 }
 
@@ -104,6 +336,32 @@ namespace katherine_inventory_with_pos.Forms
             }
         }
 
+        // ------------------------------------------------------------------
+        // Register a brand-new product straight from the POS screen
+        // ------------------------------------------------------------------
+        private void btnRegisterProduct_Click(object sender, EventArgs e)
+        {
+            RegisterAndAddProduct(txtBarcode.Text.Trim());
+        }
+
+        private void RegisterAndAddProduct(string prefillCode)
+        {
+            using (frmQuickAddProduct form = new frmQuickAddProduct(prefillCode))
+            {
+                if (form.ShowDialog(this) == DialogResult.OK)
+                {
+                    txtBarcode.Clear();
+                    AddToCart(form.NewProductID, form.NewProductCode, form.NewProductName,
+                        form.NewProductPrice, form.NewProductQuantity);
+                    LoadProducts(); // so the new product shows up in the list
+                }
+            }
+            txtBarcode.Focus();
+        }
+
+        // ------------------------------------------------------------------
+        // Cart maintenance
+        // ------------------------------------------------------------------
         private void AddToCart(string productId, string code, string name, decimal price, int availableStock)
         {
             CartItem existing = cart.FirstOrDefault(c => c.ProductID == productId);
@@ -117,7 +375,7 @@ namespace katherine_inventory_with_pos.Forms
                     return;
                 }
                 existing.Quantity += 1;
-                RefreshCartGrid();
+                dgvCart.Refresh();
             }
             else
             {
@@ -137,36 +395,25 @@ namespace katherine_inventory_with_pos.Forms
                     Quantity = 1,
                     AvailableStock = availableStock
                 });
-            }
 
-            RecalculateTotal();
-        }
-
-        // ------------------------------------------------------------------
-        // Register a brand-new product straight from the POS screen
-        // ------------------------------------------------------------------
-        private void btnRegisterProduct_Click(object sender, EventArgs e)
-        {
-            RegisterAndAddProduct(txtBarcode.Text.Trim());
-        }
-
-        private void RegisterAndAddProduct(string prefillCode)
-        {
-            using (frmQuickAddProduct form = new frmQuickAddProduct(prefillCode))
-            {
-                if (form.ShowDialog(this) == DialogResult.OK)
+                // keep the newest line visible and selected
+                if (dgvCart.Rows.Count > 0)
                 {
-                    txtBarcode.Clear();
-                    AddToCart(form.NewProductID, form.NewProductCode, form.NewProductName,
-                        form.NewProductPrice, form.NewProductQuantity);
+                    int last = dgvCart.Rows.Count - 1;
+                    dgvCart.CurrentCell = dgvCart.Rows[last].Cells[colProductName.Index];
                 }
             }
-            txtBarcode.Focus();
+
+            RecalculateTotals();
         }
 
-        // ------------------------------------------------------------------
-        // Cart maintenance
-        // ------------------------------------------------------------------
+        private CartItem SelectedCartItem()
+        {
+            if (dgvCart.CurrentRow == null) return null;
+            int index = dgvCart.CurrentRow.Index;
+            return (index >= 0 && index < cart.Count) ? cart[index] : null;
+        }
+
         private void dgvCart_CellEndEdit(object sender, DataGridViewCellEventArgs e)
         {
             if (e.ColumnIndex != colQuantity.Index) return;
@@ -182,19 +429,56 @@ namespace katherine_inventory_with_pos.Forms
                 item.Quantity = item.AvailableStock;
             }
 
-            RefreshCartGrid();
-            RecalculateTotal();
+            dgvCart.Refresh();
+            RecalculateTotals();
+        }
+
+        // Typing letters in the Qty cell would otherwise throw a grid exception dialog.
+        private void dgvCart_DataError(object sender, DataGridViewDataErrorEventArgs e)
+        {
+            e.ThrowException = false;
+            MessageBox.Show("Please enter a whole number for the quantity.", "Invalid Quantity",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = false;
+        }
+
+        private void btnQtyPlus_Click(object sender, EventArgs e)
+        {
+            CartItem item = SelectedCartItem();
+            if (item == null) return;
+
+            if (item.Quantity + 1 > item.AvailableStock)
+            {
+                MessageBox.Show("Only " + item.AvailableStock + " unit(s) of \"" + item.ProductName + "\" available.",
+                    "Insufficient Stock", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            item.Quantity += 1;
+            dgvCart.Refresh();
+            RecalculateTotals();
+        }
+
+        private void btnQtyMinus_Click(object sender, EventArgs e)
+        {
+            CartItem item = SelectedCartItem();
+            if (item == null) return;
+
+            if (item.Quantity > 1)
+            {
+                item.Quantity -= 1;
+                dgvCart.Refresh();
+                RecalculateTotals();
+            }
         }
 
         private void btnRemoveItem_Click(object sender, EventArgs e)
         {
-            if (dgvCart.CurrentRow == null) return;
-            int index = dgvCart.CurrentRow.Index;
-            if (index >= 0 && index < cart.Count)
-            {
-                cart.RemoveAt(index);
-                RecalculateTotal();
-            }
+            CartItem item = SelectedCartItem();
+            if (item == null) return;
+
+            cart.Remove(item);
+            RecalculateTotals();
         }
 
         private void btnClearCart_Click(object sender, EventArgs e)
@@ -206,38 +490,137 @@ namespace katherine_inventory_with_pos.Forms
                 if (confirm.ShowDialog(this) != DialogResult.Yes) return;
             }
 
+            ResetOrder();
+        }
+
+        /// <summary>Empties the cart and puts discount / payment back to their starting values.</summary>
+        private void ResetOrder()
+        {
             cart.Clear();
-            RecalculateTotal();
+            cboDiscountType.SelectedIndex = DiscNone;
+            numDiscountValue.Value = 0;
+            numAmountPaid.Value = 0;
+            RecalculateTotals();
+            txtBarcode.Focus();
         }
 
-        private void RefreshCartGrid()
+        // ------------------------------------------------------------------
+        // Discount, VAT and totals
+        // ------------------------------------------------------------------
+        private static decimal Round2(decimal value)
         {
-            dgvCart.Refresh();
+            return Math.Round(value, 2, MidpointRounding.AwayFromZero);
         }
 
-        private decimal CartTotal
+        private OrderTotals ComputeTotals()
         {
-            get { return cart.Sum(c => c.Subtotal); }
+            OrderTotals t = new OrderTotals();
+            t.Subtotal = Round2(cart.Sum(c => c.Subtotal));
+
+            switch (cboDiscountType.SelectedIndex)
+            {
+                case DiscSenior:
+                case DiscPwd:
+                    t.Discount = Round2(t.Subtotal * SeniorPwdRate);
+                    break;
+                case DiscPercent:
+                    t.Discount = Round2(t.Subtotal * (numDiscountValue.Value / 100m));
+                    break;
+                case DiscFixed:
+                    t.Discount = Round2(numDiscountValue.Value);
+                    break;
+                default:
+                    t.Discount = 0m;
+                    break;
+            }
+
+            if (t.Discount > t.Subtotal) t.Discount = t.Subtotal;
+
+            decimal afterDiscount = t.Subtotal - t.Discount;
+
+            if (PricesIncludeVat)
+            {
+                // VAT is already inside the price: just show how much of it is VAT.
+                t.Vat = Round2(afterDiscount * VatRate / (1m + VatRate));
+                t.Total = afterDiscount;
+            }
+            else
+            {
+                t.Vat = Round2(afterDiscount * VatRate);
+                t.Total = afterDiscount + t.Vat;
+            }
+
+            return t;
         }
 
-        private void RecalculateTotal()
+        private string DiscountLabel()
         {
-            lblTotalValue.Text = CartTotal.ToString("N2");
-            RecalculateChange();
+            switch (cboDiscountType.SelectedIndex)
+            {
+                case DiscSenior: return "Senior Citizen";
+                case DiscPwd: return "PWD";
+                case DiscPercent: return "Custom " + numDiscountValue.Value.ToString("0.##") + "%";
+                case DiscFixed: return "Fixed amount";
+                default: return null;
+            }
+        }
+
+        private void cboDiscountType_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            int type = cboDiscountType.SelectedIndex;
+
+            // Only "Custom %" and "Fixed amount" need a typed value.
+            numDiscountValue.Enabled = (type == DiscPercent || type == DiscFixed);
+
+            if (type == DiscPercent)
+            {
+                numDiscountValue.Maximum = 100m;
+            }
+            else
+            {
+                numDiscountValue.Maximum = 10000000m;
+            }
+
+            if (!numDiscountValue.Enabled) numDiscountValue.Value = 0;
+
+            RecalculateTotals();
+        }
+
+        private void numDiscountValue_ValueChanged(object sender, EventArgs e)
+        {
+            RecalculateTotals();
+        }
+
+        private void RecalculateTotals()
+        {
+            OrderTotals t = ComputeTotals();
+
+            lblSubtotalValue.Text = t.Subtotal.ToString("N2");
+            lblDiscountValue.Text = t.Discount > 0 ? "-" + t.Discount.ToString("N2") : "0.00";
+            lblVatValue.Text = t.Vat.ToString("N2");
+            lblTotalValue.Text = t.Total.ToString("N2");
+
+            RecalculateChange(t);
         }
 
         private void numAmountPaid_ValueChanged(object sender, EventArgs e)
         {
-            RecalculateChange();
+            RecalculateChange(ComputeTotals());
         }
 
-        private void RecalculateChange()
+        private void btnExact_Click(object sender, EventArgs e)
         {
-            decimal change = numAmountPaid.Value - CartTotal;
+            decimal total = ComputeTotals().Total;
+            numAmountPaid.Value = Math.Min(total, numAmountPaid.Maximum);
+        }
+
+        private void RecalculateChange(OrderTotals t)
+        {
+            decimal change = numAmountPaid.Value - t.Total;
             lblChangeValue.Text = change.ToString("N2");
             lblChangeValue.ForeColor = change < 0
-                ? System.Drawing.Color.Firebrick
-                : System.Drawing.Color.FromArgb(39, 174, 96);
+                ? Color.Firebrick
+                : Color.FromArgb(39, 174, 96);
         }
 
         // ------------------------------------------------------------------
@@ -252,18 +635,20 @@ namespace katherine_inventory_with_pos.Forms
                 return;
             }
 
-            decimal total = CartTotal;
+            OrderTotals totals = ComputeTotals();
 
-            if (numAmountPaid.Value < total)
+            if (numAmountPaid.Value < totals.Total)
             {
-                MessageBox.Show("Amount paid is less than the total due.", "Insufficient Payment",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Amount paid is less than the total due (" + totals.Total.ToString("N2") + ").",
+                    "Insufficient Payment", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                numAmountPaid.Focus();
                 return;
             }
 
             decimal amountPaid = numAmountPaid.Value;
-            decimal change = amountPaid - total;
+            decimal change = amountPaid - totals.Total;
             string paymentMethod = cboPaymentMethod.SelectedItem == null ? "Cash" : cboPaymentMethod.SelectedItem.ToString();
+            string discountLabel = DiscountLabel();
             string saleId = IdGenerator.Next("tbl_sale", "sale_id", "SALE", 6);
 
             using (MySqlConnection conn = DBConnection.GetConnection())
@@ -274,13 +659,19 @@ namespace katherine_inventory_with_pos.Forms
                 try
                 {
                     using (MySqlCommand cmd = new MySqlCommand(
-                        "INSERT INTO tbl_sale (sale_id, cashier_id, subtotal, total_amount, amount_paid, change_due, payment_method, sale_status) " +
-                        "VALUES (@SaleID, @UserID, @Total, @Total, @Paid, @Change, @Method, 'Completed');",
+                        "INSERT INTO tbl_sale (sale_id, cashier_id, subtotal, discount_amount, discount_type, tax_amount, " +
+                        "total_amount, amount_paid, change_due, payment_method, sale_status) " +
+                        "VALUES (@SaleID, @UserID, @Subtotal, @Discount, @DiscountType, @Tax, " +
+                        "@Total, @Paid, @Change, @Method, 'Completed');",
                         conn, transaction))
                     {
                         cmd.Parameters.AddWithValue("@SaleID", saleId);
                         cmd.Parameters.AddWithValue("@UserID", SessionManager.UserID);
-                        cmd.Parameters.AddWithValue("@Total", total);
+                        cmd.Parameters.AddWithValue("@Subtotal", totals.Subtotal);
+                        cmd.Parameters.AddWithValue("@Discount", totals.Discount);
+                        cmd.Parameters.AddWithValue("@DiscountType", (object)discountLabel ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@Tax", totals.Vat);
+                        cmd.Parameters.AddWithValue("@Total", totals.Total);
                         cmd.Parameters.AddWithValue("@Paid", amountPaid);
                         cmd.Parameters.AddWithValue("@Change", change);
                         cmd.Parameters.AddWithValue("@Method", paymentMethod);
@@ -301,13 +692,19 @@ namespace katherine_inventory_with_pos.Forms
                             cmd.ExecuteNonQuery();
                         }
 
+                        // Only deduct if enough stock is still there (another terminal may have sold it).
                         using (MySqlCommand cmd = new MySqlCommand(
-                            "UPDATE tbl_stock SET quantity = quantity - @Qty WHERE product_id = @ProductID;",
+                            "UPDATE tbl_stock SET quantity = quantity - @Qty " +
+                            "WHERE product_id = @ProductID AND quantity >= @Qty;",
                             conn, transaction))
                         {
                             cmd.Parameters.AddWithValue("@Qty", item.Quantity);
                             cmd.Parameters.AddWithValue("@ProductID", item.ProductID);
-                            cmd.ExecuteNonQuery();
+                            if (cmd.ExecuteNonQuery() == 0)
+                            {
+                                throw new InvalidOperationException(
+                                    "Not enough stock left for \"" + item.ProductName + "\".");
+                            }
                         }
 
                         using (MySqlCommand cmd = new MySqlCommand(
@@ -324,27 +721,36 @@ namespace katherine_inventory_with_pos.Forms
                     }
 
                     transaction.Commit();
-
-                    PrintReceipt(saleId, total, amountPaid, change, paymentMethod);
-
-                    cart.Clear();
-                    numAmountPaid.Value = 0;
-                    RecalculateTotal();
-                    txtBarcode.Focus();
                 }
                 catch (Exception ex)
                 {
                     transaction.Rollback();
                     MessageBox.Show("Checkout failed and was cancelled:\n" + ex.Message, "Error",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    LoadProducts(); // stock numbers may have changed
+                    return;
                 }
             }
+
+            // The sale is saved. Build the receipt BEFORE clearing the cart.
+            lastReceipt = BuildReceipt(saleId, totals, discountLabel, amountPaid, change, paymentMethod);
+            btnReprint.Enabled = true;
+
+            ResetOrder();
+            LoadProducts();
+            ShowReceipt(lastReceipt);
+            txtBarcode.Focus();
         }
 
-        private void PrintReceipt(string saleId, decimal total, decimal amountPaid, decimal change, string paymentMethod)
+        // ------------------------------------------------------------------
+        // Receipt
+        // ------------------------------------------------------------------
+        private List<string> BuildReceipt(string saleId, OrderTotals t, string discountLabel,
+            decimal amountPaid, decimal change, string paymentMethod)
         {
             List<string> lines = new List<string>();
             const int width = 40;
+            string vatPct = (VatRate * 100m).ToString("0") + "%";
 
             lines.Add(Center("KATHERINE STORE", width));
             lines.Add(Center("Inventory & POS System", width));
@@ -357,21 +763,56 @@ namespace katherine_inventory_with_pos.Forms
             foreach (CartItem item in cart)
             {
                 lines.Add(Truncate(item.ProductName, width));
-                string qtyLine = string.Format("  {0} x {1,10:N2} = {2,10:N2}",
-                    item.Quantity.ToString().PadRight(3), item.UnitPrice, item.Subtotal);
-                lines.Add(qtyLine);
+                lines.Add(PadLeftRight(
+                    "  " + item.Quantity + " x " + item.UnitPrice.ToString("N2"),
+                    item.Subtotal.ToString("N2"), width));
             }
 
             lines.Add(new string('-', width));
-            lines.Add(PadLeftRight("TOTAL", total.ToString("N2"), width));
+            lines.Add(PadLeftRight("Subtotal", t.Subtotal.ToString("N2"), width));
+
+            if (t.Discount > 0)
+            {
+                lines.Add(PadLeftRight("Discount (" + discountLabel + ")", "-" + t.Discount.ToString("N2"), width));
+            }
+
+            lines.Add(PadLeftRight(
+                PricesIncludeVat ? "VAT " + vatPct + " (included)" : "VAT " + vatPct,
+                t.Vat.ToString("N2"), width));
+            lines.Add(new string('=', width));
+            lines.Add(PadLeftRight("TOTAL", t.Total.ToString("N2"), width));
+            lines.Add(new string('=', width));
             lines.Add(PadLeftRight("Payment Method", paymentMethod, width));
             lines.Add(PadLeftRight("Amount Paid", amountPaid.ToString("N2"), width));
             lines.Add(PadLeftRight("Change", change.ToString("N2"), width));
             lines.Add(new string('-', width));
             lines.Add(Center("Thank you for shopping!", width));
 
-            ReceiptPrinter printer = new ReceiptPrinter(lines);
-            printer.ShowPreview();
+            return lines;
+        }
+
+        private void ShowReceipt(List<string> lines)
+        {
+            try
+            {
+                ReceiptPrinter printer = new ReceiptPrinter(lines);
+                if (chkPrintDirect.Checked)
+                    printer.Print();
+                else
+                    printer.ShowPreview();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("The sale was saved, but the receipt could not be printed:\n" + ex.Message +
+                    "\n\nYou can try again with \"Reprint Last Receipt\".", "Printing Problem",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void btnReprint_Click(object sender, EventArgs e)
+        {
+            if (lastReceipt == null) return;
+            ShowReceipt(lastReceipt);
         }
 
         private static string Center(string text, int width)
@@ -388,6 +829,8 @@ namespace katherine_inventory_with_pos.Forms
 
         private static string PadLeftRight(string left, string right, int width)
         {
+            if (left.Length + right.Length + 1 > width)
+                left = left.Substring(0, Math.Max(0, width - right.Length - 1));
             int spaces = width - left.Length - right.Length;
             if (spaces < 1) spaces = 1;
             return left + new string(' ', spaces) + right;

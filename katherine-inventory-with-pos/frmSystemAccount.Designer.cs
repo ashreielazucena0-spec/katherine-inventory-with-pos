@@ -37,7 +37,6 @@ namespace katherine_inventory_with_pos.Forms
             this.colCreated = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.colStatus = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.pnlButtons = new System.Windows.Forms.Panel();
-            this.btnAdd = new System.Windows.Forms.Button();
             this.btnEdit = new System.Windows.Forms.Button();
             this.btnDelete = new System.Windows.Forms.Button();
             this.pnlHeader.SuspendLayout();
@@ -262,7 +261,6 @@ namespace katherine_inventory_with_pos.Forms
             // 
             // pnlButtons
             // 
-            this.pnlButtons.Controls.Add(this.btnAdd);
             this.pnlButtons.Controls.Add(this.btnEdit);
             this.pnlButtons.Controls.Add(this.btnDelete);
             this.pnlButtons.Dock = System.Windows.Forms.DockStyle.Bottom;
@@ -270,19 +268,6 @@ namespace katherine_inventory_with_pos.Forms
             this.pnlButtons.Name = "pnlButtons";
             this.pnlButtons.Size = new System.Drawing.Size(1067, 41);
             this.pnlButtons.TabIndex = 11;
-            // 
-            // btnAdd
-            // 
-            this.btnAdd.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
-            this.btnAdd.BackColor = System.Drawing.Color.Coral;
-            this.btnAdd.Font = new System.Drawing.Font("Microsoft Sans Serif", 7.8F, System.Drawing.FontStyle.Bold);
-            this.btnAdd.Location = new System.Drawing.Point(659, 4);
-            this.btnAdd.Name = "btnAdd";
-            this.btnAdd.Size = new System.Drawing.Size(116, 37);
-            this.btnAdd.TabIndex = 8;
-            this.btnAdd.Text = "ADD";
-            this.btnAdd.UseVisualStyleBackColor = false;
-            this.btnAdd.Click += new System.EventHandler(this.btnAdd_Click);
             // 
             // btnEdit
             // 
@@ -361,7 +346,6 @@ namespace katherine_inventory_with_pos.Forms
         private System.Windows.Forms.DataGridViewTextBoxColumn colCreated;
         private System.Windows.Forms.DataGridViewTextBoxColumn colStatus;
         private System.Windows.Forms.Panel pnlButtons;
-        private System.Windows.Forms.Button btnAdd;
         private System.Windows.Forms.Button btnEdit;
         private System.Windows.Forms.Button btnDelete;
     }

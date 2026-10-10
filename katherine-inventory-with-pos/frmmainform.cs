@@ -17,7 +17,7 @@ namespace katherine_inventory_with_pos
             timer1.Start();
             ApplySessionToUi();
 
-            OpenChildForm(new frmHome());
+            ClearChildForms();
         }
 
         private void ApplySessionToUi()
@@ -33,17 +33,26 @@ namespace katherine_inventory_with_pos
         }
 
         /// <summary>
+        /// Removes and disposes every child form shown in the main content area,
+        /// leaving the panel blank.
+        /// </summary>
+        private void ClearChildForms()
+        {
+            for (int i = panelMain.Controls.Count - 1; i >= 0; i--)
+            {
+                Control c = panelMain.Controls[i];
+                panelMain.Controls.RemoveAt(i);
+                c.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Loads a form into the main content area, replacing whatever was shown
         /// before. This mimics an MDI child area without requiring IsMdiContainer.
         /// </summary>
         private void OpenChildForm(Form childForm)
         {
-            if (panelMain.Controls.Count > 0)
-            {
-                Form previous = panelMain.Controls[0] as Form;
-                panelMain.Controls.RemoveAt(0);
-                if (previous != null) previous.Dispose();
-            }
+            ClearChildForms();
 
             childForm.TopLevel = false;
             childForm.FormBorderStyle = FormBorderStyle.None;
@@ -57,7 +66,7 @@ namespace katherine_inventory_with_pos
         // ------------------------------------------------------------------
         private void toolStripButton1_Click(object sender, EventArgs e)
         {
-            OpenChildForm(new frmHome());
+            ClearChildForms();
         }
 
         private void toolStripButton2_Click(object sender, EventArgs e)
@@ -125,7 +134,7 @@ namespace katherine_inventory_with_pos
                 if (loginForm.ShowDialog() == DialogResult.OK)
                 {
                     ApplySessionToUi();
-                    OpenChildForm(new frmHome());
+                    ClearChildForms();
                     this.Show();
                 }
                 else
